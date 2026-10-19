@@ -342,6 +342,7 @@ class Mouth:
         # Worker-thread-only — never touch from other threads.
         self._out: sd.OutputStream | None = None
         self._out_rate: int | None = None
+        self._out_device: str | None = None
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
@@ -417,28 +418,49 @@ class Mouth:
                     signals.set_state("idle")
 
     def _get_out(self, rate: int) -> sd.OutputStream:
-        """The long-lived stream (audio law #1). Reopened only when the
-        sample rate changes (ElevenLabs 44.1k <-> Kokoro 24k fallback:
-        rare, costs at most one blip on the switch)."""
+        """The long-lived stream (audio law #1). Reopened when the sample
+        rate changes (ElevenLabs 44.1k <-> Kokoro 24k fallback: rare, costs
+        at most one blip on the switch) OR when the system default OUTPUT
+        changed since the stream was opened: CoreAudio never re-routes a
+        running stream, so e.g. AirPods connecting after the first reply
+        would otherwise never hear this voice until the process restarts.
+        The check is per-sentence: a switch mid-sentence finishes on the
+        device it started on, and the next sentence follows the new one."""
+        current_device = self._current_default_device()
         if self._out is not None and self._out_rate == rate:
-            # Guarded, because the stream can die UNDER us: the ears
-            # rebuild the whole audio system to recover from a device
-            # change (see ears._reopen_after_device_change), and that
-            # closes every open stream including this one. Touching a
-            # dead stream raises rather than returning False, so the
-            # check has to be the try, not an `if`. Falling through
-            # rebuilds it, which is what the rest of this method does.
-            try:
-                if not self._out.active:
-                    self._out.start()
-                return self._out
-            except Exception:
-                log("[mouth] the output stream went away, reopening")
+            if current_device is not None and self._out_device != current_device:
+                log(f"[mouth] the output device changed to '{current_device}', reopening")
+                self._drop_out()
+            else:
+                # Guarded, because the stream can die UNDER us: the ears
+                # rebuild the whole audio system to recover from a device
+                # change (see ears._reopen_after_device_change), and that
+                # closes every open stream including this one. Touching a
+                # dead stream raises rather than returning False, so the
+                # check has to be the try, not an `if`. Falling through
+                # rebuilds it, which is what the rest of this method does.
+                try:
+                    if not self._out.active:
+                        self._out.start()
+                    return self._out
+                except Exception:
+                    log("[mouth] the output stream went away, reopening")
         self._drop_out()
         self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
         self._out_rate = rate
+        self._out_device = current_device
         self._out.start()
         return self._out
+
+    @staticmethod
+    def _current_default_device() -> str | None:
+        """The name of the current system default OUTPUT device (None when
+        PortAudio cannot tell). A name, never an index: indices shift every
+        time a device joins or leaves."""
+        try:
+            return sd.query_devices(kind="output")["name"]
+        except Exception:
+            return None
 
     def _cut(self):
         """Barge-in cut: stop feeding audio and pad the line with a beat
