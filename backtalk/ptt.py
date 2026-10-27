@@ -64,6 +64,7 @@ def resolve_key(name: str):
         "right_ctrl": "ctrl_r", "left_ctrl": "ctrl_l",
         "right_cmd": "cmd_r", "left_cmd": "cmd_l",
         "right_shift": "shift_r", "left_shift": "shift_l",
+        "control": "ctrl", "command": "cmd", "option": "alt",
     }
     name = aliases.get(name, name)
     try:
@@ -72,6 +73,82 @@ def resolve_key(name: str):
         print(f"[ptt] unknown key {name!r} — falling back to 'home'",
               flush=True)
         return keyboard.Key.home
+
+
+def parse_chord(name: str) -> list:
+    """'shift+control+command+m' -> [Key.shift, Key.ctrl, Key.cmd, 'm'
+    as a KeyCode]. A plain key with no '+' is a one-item chord, so a
+    single key behaves exactly like it always has."""
+    parts = [p.strip() for p in (name or "").split("+") if p.strip()]
+    return [resolve_key(p) for p in parts]
+
+
+def interrupt_key_conflicts(ptt_key: str, interrupt_key: str) -> bool:
+    """True when the interrupt key names the same physical key as the
+    talk key. Both use the same tap-to-fire listener, so a duplicate
+    would race the talk key's own listener instead of doing anything —
+    the caller should disable the second listener rather than create it."""
+    if not interrupt_key:
+        return False
+    chord = parse_chord(interrupt_key)
+    # A chord needs every key held at once; it can never equal the single
+    # ptt_key, so only a lone key can conflict.
+    if len(chord) != 1:
+        return False
+    return chord[0] == resolve_key(ptt_key)
+
+
+def _decontrol(k):
+    """Undo macOS's Control+letter translation. Holding Control turns the
+    letter key's reported character into its C0 control code (Control+M
+    arrives as '\\r', not 'm') even though the physical key is still M, so
+    a chord that includes Control would otherwise never match its own
+    configured letter. Only codes 1-26 are ASCII control codes for a-z;
+    anything else (actual Tab/Enter/Backspace) arrives as a Key enum, not
+    a KeyCode, and never reaches here."""
+    if (isinstance(k, keyboard.KeyCode) and k.char is not None
+            and len(k.char) == 1 and 1 <= ord(k.char) <= 26):
+        return keyboard.KeyCode.from_char(chr(ord(k.char) + 96))
+    return k
+
+
+class ChordListener:
+    """Tap-to-fire, but the 'key' is several keys held at once (e.g. an
+    interrupt bound to shift+control+command+m so it can't be hit by
+    accident). Fires once per full hold — every member down together —
+    and re-arms only once every member has been released, so holding
+    past the fire or re-pressing one key while others are still down
+    can't fire it twice."""
+
+    def __init__(self, keys):
+        self._keys = set(keys)
+        self._held = set()
+        self._armed = True
+        self._press_evt = threading.Event()
+        self._listener = keyboard.Listener(on_press=self.on_press,
+                                           on_release=self.on_release)
+        self._listener.daemon = True
+        self._listener.start()
+
+    def on_press(self, k):
+        k = _decontrol(k)
+        if k not in self._keys:
+            return
+        self._held.add(k)
+        if self._armed and self._held == self._keys:
+            self._armed = False
+            self._press_evt.set()
+
+    def on_release(self, k):
+        self._held.discard(_decontrol(k))
+        if not self._held:
+            self._armed = True
+
+    def wait_press(self, timeout=None):
+        fired = self._press_evt.wait(timeout)
+        if fired:
+            self._press_evt.clear()
+        return fired
 
 
 class PTTListener:

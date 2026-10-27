@@ -67,7 +67,8 @@ from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
 from backtalk.mouth import Mouth
-from backtalk.ptt import PTTListener
+from backtalk.ptt import (ChordListener, PTTListener, interrupt_key_conflicts,
+                           parse_chord)
 from backtalk.vlog import log
 
 NAME = CFG["name"]
@@ -945,6 +946,21 @@ async def amain():
         # callable closes the in-flight open mic promptly, and any
         # capture born under an old gen is discarded unprocessed.
         ptt = PTTListener(CFG["ptt_key"])
+        # Optional second key: a tap kills playback and cancels the
+        # in-flight turn — no mic, no recording. Disabled (None) when
+        # unset or when it would just duplicate the talk key.
+        interrupt_key = str(CFG.get("interrupt_key") or "").strip()
+        if interrupt_key and interrupt_key_conflicts(CFG["ptt_key"],
+                                                      interrupt_key):
+            log(f"[backtalk] interrupt_key ({interrupt_key!r}) is the "
+                f"same key as ptt_key — ignoring it")
+            interrupt_key = ""
+        stopper = None
+        if interrupt_key:
+            chord = parse_chord(interrupt_key)
+            stopper = (ChordListener(chord) if len(chord) > 1
+                       else PTTListener(interrupt_key))
+        stop_fut: asyncio.Future | None = None
         press_fut: asyncio.Future | None = None
         mic_fut: asyncio.Future | None = None
         mic_gen_seen = _MIC["gen"]
@@ -967,7 +983,11 @@ async def amain():
                 typed_fut = loop.run_in_executor(None, typed_q.get)
             if press_fut is None:
                 press_fut = loop.run_in_executor(None, ptt.wait_press)
+            if stopper is not None and stop_fut is None:
+                stop_fut = loop.run_in_executor(None, stopper.wait_press)
             waiters = {press_fut, typed_fut}
+            if stop_fut is not None:
+                waiters.add(stop_fut)
             if _MIC["mode"] == "open":
                 if mic_fut is None:
                     g = _MIC["gen"]
@@ -1005,6 +1025,27 @@ async def amain():
                     continue             # captured before a switch
                 if text and not await handle(text):
                     return
+                continue
+            if stop_fut is not None and stop_fut in done:
+                stop_fut.result(); stop_fut = None
+                # During a pending permission ask the turn stays alive
+                # (same rule as the talk key below) — this just kills
+                # the audio, never the ask.
+                perm_wait = (_PERM["fut"] is not None
+                             and not _PERM["fut"].done())
+                if speak_task and not speak_task.done() and not perm_wait:
+                    log("[turn] interrupted — stop key pressed")
+                    speak_task.cancel()
+                    try:
+                        await speak_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                    speak_task = None
+                mouth.shut_up()
+                signals.static_stop()
+                signals.set_state("idle")
                 continue
             if press_fut in done:
                 press_fut.result(); press_fut = None

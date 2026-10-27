@@ -89,6 +89,14 @@ DEFAULTS = {
     # Hold-to-talk key. Named keys ("home", "f13", "right_alt", ...)
     # or a single character.
     "ptt_key": "home",
+    # Optional second key: a tap (no hold) cuts the current reply dead
+    # and cancels whatever the agent is doing — no mic, no recording,
+    # just stop. "" disables it. Must differ from ptt_key or it is
+    # disabled automatically (see ptt.interrupt_key_conflicts). Join
+    # several names with "+" (e.g. "shift+control+command+m") for a
+    # chord that only fires when every key is held at once — harder to
+    # trigger by accident than a single key.
+    "interrupt_key": "",
     # The microphone mode. "ptt" (push to talk, the default and the
     # recommendation): the mic is closed except while the key is held,
     # so room audio and your own speakers can never trigger the agent.
